@@ -8,7 +8,6 @@ scipy
 matplotlib
 seaborn
 openpyxl
-streamlit
-pandas
 scikit-image
 scikit-learn
+joblib
