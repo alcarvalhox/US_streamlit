@@ -1,13 +1,23 @@
 
 import os
-import sys
 import io
+import json
+import glob
 import math
 import zipfile
 import tempfile
-import subprocess
+import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+import cv2
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+from ultralytics import YOLO
+from scipy.spatial import cKDTree
 
 # =====================================================================
 # BLOQUEIO DE LOGS, TELEMETRIA E "PHONE HOME" DO YOLO
@@ -22,39 +32,10 @@ os.environ['YOLO_TELEMETRY'] = 'False'
 os.environ['YOLO_UPDATE_CHECK'] = 'False'
 os.environ['YOLO_SYNC'] = 'False'
 
-# =====================================================================
-# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS (opcional)
-# =====================================================================
-def install_dependencies():
-    if os.path.exists("requirements.txt"):
-        try:
-            if 'dependencies_installed_hybrid_modelo' not in os.environ:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-                os.environ['dependencies_installed_hybrid_modelo'] = '1'
-        except Exception as e:
-            print(f"Erro ao instalar dependências: {e}")
-
-if __name__ == "__main__":
-    install_dependencies()
-
-import cv2
-import joblib
-import numpy as np
-import pandas as pd
-import streamlit as st
-from ultralytics import YOLO
-from scipy.spatial import cKDTree
-
-# Permite importar o vetor tabular já criado anteriormente, assumindo que o arquivo
-# pipeline_tabular_us_2026_revisado.py está no mesmo diretório deste app.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
-
-from pipeline_tabular_us_2026_revisado import TableVectorizer
+warnings.filterwarnings("ignore")
 
 # =====================================================================
-# 1. CONFIGURAÇÕES GLOBAIS
+# CONFIGURAÇÕES GLOBAIS
 # =====================================================================
 CONFIG_MODELOS = {
     "Alma": ["best_alma_3.pt", "best_patim_1.pt"],
@@ -71,22 +52,19 @@ LIMITES_PROFUNDIDADE = {
 SONDAS_ESQUERDA = [0, 6, 8, 4, 10]
 SONDAS_DIREITA = [1, 7, 9, 5, 11]
 
-# ---------------------------------------------------------------------
-# AJUSTE PEDIDO PELO USUÁRIO:
-# TODOS os artefatos ficam na pasta `modelo` do GitHub.
-# ---------------------------------------------------------------------
+# Tudo em modelo/
 MODEL_DIR = "modelo"
 ARTIFACTS_DIR = MODEL_DIR
 
-# Tamanho da janela física por imagem B-scan
-WINDOW_MM = 2400  # 2,4 m em mm
+# Janela física da imagem B-scan (2,4 m)
+WINDOW_MM = 2400
 STEP_MM = 2400
 
 # Tamanho da imagem sintética para o YOLO
 BSCAN_WIDTH = 1500
 BSCAN_HEIGHT = 500
 
-# Cores visuais por probe
+# Cores por probe
 PROBE_TO_BGR = {
     0: (0, 255, 255), 1: (0, 255, 255),
     6: (0, 128, 0),   7: (0, 128, 0),
@@ -96,12 +74,294 @@ PROBE_TO_BGR = {
 }
 
 # =====================================================================
-# 2. FUNÇÕES AUXILIARES
+# CONFIGURAÇÕES DO PIPELINE TABULAR (EMBUTIDO NO ARQUIVO)
+# =====================================================================
+# Revisão solicitada: desconsiderar x_m e odo_km nas análises estatísticas
+# e nas features vetoriais. Eles podem ser usados apenas para ordenar a sequência.
+EXPECTED_NUMERIC = ["depth_mm", "level", "angle"]
+EXPECTED_CATEGORICAL = ["probe", "side", "kind", "kind_low", "marker_code"]
+ORDER_HINT = ["depth_mm", "level", "probe", "side", "angle", "kind", "kind_low", "marker_code"]
+SORT_HINT = ["x_m", "odo_km"]
+RANDOM_STATE = 42
+
+# =====================================================================
+# FUNÇÕES UTILITÁRIAS DO PIPELINE TABULAR
+# =====================================================================
+def robust_mode(series: pd.Series):
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    m = s.mode(dropna=True)
+    return m.iloc[0] if not m.empty else s.iloc[0]
+
+
+def entropy_from_series(series: pd.Series) -> float:
+    s = series.dropna().astype(str)
+    if s.empty:
+        return 0.0
+    counts = s.value_counts().values.astype(float)
+    p = counts / counts.sum()
+    p = p[p > 0]
+    return float(-(p * np.log2(p)).sum())
+
+
+def cv_safe(values: np.ndarray) -> float:
+    mean_val = float(np.mean(values))
+    std_val = float(np.std(values))
+    if abs(mean_val) < 1e-12:
+        return 0.0
+    return std_val / mean_val
+
+
+def slope_1d(values: np.ndarray) -> float:
+    if len(values) < 2:
+        return 0.0
+    x = np.arange(len(values), dtype=float)
+    y = values.astype(float)
+    xm = x.mean()
+    ym = y.mean()
+    denom = np.sum((x - xm) ** 2)
+    if denom == 0:
+        return 0.0
+    return float(np.sum((x - xm) * (y - ym)) / denom)
+
+
+def sorted_if_present(df: pd.DataFrame) -> pd.DataFrame:
+    sort_cols = [c for c in SORT_HINT if c in df.columns]
+    if sort_cols:
+        return df.sort_values(sort_cols).reset_index(drop=True)
+    return df.reset_index(drop=True)
+
+
+@dataclass
+class TableVectorizer:
+    numeric_cols: Optional[List[str]] = None
+    categorical_cols: Optional[List[str]] = None
+    learned_categories_: Optional[Dict[str, List[str]]] = None
+    feature_names_: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.numeric_cols is None:
+            self.numeric_cols = []
+        if self.categorical_cols is None:
+            self.categorical_cols = []
+        if self.learned_categories_ is None:
+            self.learned_categories_ = {}
+        if self.feature_names_ is None:
+            self.feature_names_ = []
+
+    def fit(self, csv_paths: List[str]):
+        numeric_union = set()
+        categorical_union = set()
+        cat_values = {}
+
+        for fp in csv_paths:
+            df = pd.read_csv(fp)
+            for col in df.columns:
+                if col in EXPECTED_NUMERIC:
+                    numeric_union.add(col)
+                elif col in EXPECTED_CATEGORICAL:
+                    categorical_union.add(col)
+
+        self.numeric_cols = [c for c in ORDER_HINT if c in numeric_union and c in EXPECTED_NUMERIC]
+        self.categorical_cols = [c for c in ORDER_HINT if c in categorical_union and c in EXPECTED_CATEGORICAL]
+
+        for col in self.categorical_cols:
+            cat_values[col] = set()
+
+        for fp in csv_paths:
+            df = pd.read_csv(fp)
+            for col in self.categorical_cols:
+                if col in df.columns:
+                    vals = df[col].astype(str).fillna("<NA>").unique().tolist()
+                    cat_values[col].update(vals)
+
+        self.learned_categories_ = {c: sorted(list(v)) for c, v in cat_values.items()}
+        self.feature_names_ = self._build_feature_names()
+        return self
+
+    def _build_feature_names(self) -> List[str]:
+        names = []
+
+        names.extend([
+            "n_rows",
+            "depth_span_global",
+            "level_span_global",
+        ])
+
+        for col in self.numeric_cols:
+            names.extend([
+                f"{col}__mean",
+                f"{col}__std",
+                f"{col}__min",
+                f"{col}__q25",
+                f"{col}__median",
+                f"{col}__q75",
+                f"{col}__max",
+                f"{col}__range",
+                f"{col}__iqr",
+                f"{col}__cv",
+                f"{col}__slope",
+                f"{col}__diff_mean",
+                f"{col}__diff_std",
+                f"{col}__n_unique",
+            ])
+
+        if "depth_mm" in self.numeric_cols and "level" in self.numeric_cols:
+            names.extend([
+                "corr__depth_mm__level",
+                "cov__depth_mm__level",
+            ])
+
+        for col in self.categorical_cols:
+            cats = self.learned_categories_.get(col, [])
+            names.extend([
+                f"{col}__n_unique",
+                f"{col}__entropy",
+            ])
+            for cat in cats:
+                names.append(f"{col}__mode_is__{str(cat).replace(' ', '_')}")
+            for cat in cats:
+                safe = str(cat).replace(" ", "_")
+                names.append(f"{col}__count__{safe}")
+                names.append(f"{col}__frac__{safe}")
+
+        return names
+
+    def _numeric_features(self, s: pd.Series) -> List[float]:
+        if s.dropna().empty:
+            return [0.0] * 14
+
+        arr = pd.to_numeric(s, errors="coerce").dropna().to_numpy(dtype=float)
+        diffs = np.diff(arr) if len(arr) >= 2 else np.array([0.0])
+        q25 = float(np.quantile(arr, 0.25))
+        med = float(np.quantile(arr, 0.50))
+        q75 = float(np.quantile(arr, 0.75))
+        return [
+            float(np.mean(arr)),
+            float(np.std(arr)),
+            float(np.min(arr)),
+            q25,
+            med,
+            q75,
+            float(np.max(arr)),
+            float(np.max(arr) - np.min(arr)),
+            float(q75 - q25),
+            float(cv_safe(arr)),
+            float(slope_1d(arr)),
+            float(np.mean(diffs)),
+            float(np.std(diffs)),
+            float(pd.Series(arr).nunique()),
+        ]
+
+    def _pair_features_depth_level(self, df: pd.DataFrame) -> List[float]:
+        if "depth_mm" not in df.columns or "level" not in df.columns:
+            return [0.0, 0.0]
+        temp = df[["depth_mm", "level"]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(temp) < 2:
+            return [0.0, 0.0]
+        corr = float(temp["depth_mm"].corr(temp["level"]))
+        if math.isnan(corr):
+            corr = 0.0
+        cov = float(np.cov(temp["depth_mm"].values, temp["level"].values)[0, 1])
+        return [corr, cov]
+
+    def _categorical_features(self, s: pd.Series, learned_categories: List[str]) -> List[float]:
+        if s.dropna().empty:
+            out = [0.0, 0.0]
+            out.extend([0.0] * len(learned_categories))
+            out.extend([0.0] * (2 * len(learned_categories)))
+            return out
+
+        clean = s.astype(str).fillna("<NA>")
+        counts = clean.value_counts(dropna=False)
+        mode_val = str(robust_mode(clean))
+        total = len(clean)
+
+        out = [
+            float(clean.nunique(dropna=False)),
+            float(entropy_from_series(clean)),
+        ]
+        for cat in learned_categories:
+            out.append(1.0 if mode_val == cat else 0.0)
+        for cat in learned_categories:
+            c = int(counts.get(cat, 0))
+            out.append(float(c))
+            out.append(float(c / total) if total else 0.0)
+        return out
+
+    def transform_one_df(self, df: pd.DataFrame) -> np.ndarray:
+        df = sorted_if_present(df.copy())
+        feats = []
+
+        feats.append(float(len(df)))
+
+        if "depth_mm" in df.columns:
+            arr = pd.to_numeric(df["depth_mm"], errors="coerce").dropna().to_numpy(dtype=float)
+            feats.append(float(np.max(arr) - np.min(arr)) if len(arr) else 0.0)
+        else:
+            feats.append(0.0)
+
+        if "level" in df.columns:
+            arr = pd.to_numeric(df["level"], errors="coerce").dropna().to_numpy(dtype=float)
+            feats.append(float(np.max(arr) - np.min(arr)) if len(arr) else 0.0)
+        else:
+            feats.append(0.0)
+
+        for col in self.numeric_cols:
+            if col in df.columns:
+                feats.extend(self._numeric_features(df[col]))
+            else:
+                feats.extend([0.0] * 14)
+
+        if "depth_mm" in self.numeric_cols and "level" in self.numeric_cols:
+            feats.extend(self._pair_features_depth_level(df))
+
+        for col in self.categorical_cols:
+            feats.extend(
+                self._categorical_features(df[col] if col in df.columns else pd.Series(dtype=str), self.learned_categories_.get(col, []))
+            )
+
+        return np.asarray(feats, dtype=float)
+
+    def transform_paths(self, csv_paths: List[str]) -> np.ndarray:
+        rows = []
+        for fp in csv_paths:
+            df = pd.read_csv(fp)
+            rows.append(self.transform_one_df(df))
+        if not rows:
+            return np.empty((0, len(self.feature_names_)), dtype=float)
+        return np.vstack(rows)
+
+    def save(self, path: str):
+        payload = {
+            "numeric_cols": self.numeric_cols,
+            "categorical_cols": self.categorical_cols,
+            "learned_categories_": self.learned_categories_,
+            "feature_names_": self.feature_names_,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        obj = cls(
+            numeric_cols=payload["numeric_cols"],
+            categorical_cols=payload["categorical_cols"],
+        )
+        obj.learned_categories_ = payload["learned_categories_"]
+        obj.feature_names_ = payload["feature_names_"]
+        return obj
+
+# =====================================================================
+# FUNÇÕES AUXILIARES DE APP
 # =====================================================================
 def load_image_b64(path: str) -> Optional[str]:
     if not os.path.exists(path):
         return None
-    with open(path, "rb") as f:
+    with open(path, 'rb') as f:
         import base64
         return base64.b64encode(f.read()).decode()
 
@@ -135,7 +395,7 @@ def preprocessar_raw(files: List[io.BytesIO]) -> pd.DataFrame:
     for f in files:
         f.seek(0)
         df = pd.read_csv(f)
-        df['source_upload'] = f.name
+        df['source_upload'] = getattr(f, 'name', 'upload.csv')
         lista.append(df)
     df_raw = pd.concat(lista, ignore_index=True)
     df_raw = normalize_odo_to_mm(df_raw)
@@ -165,7 +425,7 @@ def separar_lados(df_local: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
         side_upper = df_local['side'].astype(str).str.upper() if 'side' in df_local.columns else pd.Series(index=df_local.index, dtype=str)
         df_esq = df_local[side_upper.eq('LEFT')].copy()
         df_dir = df_local[side_upper.eq('RIGHT')].copy()
-    return [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
+    return [('Trilho_Esq', df_esq), ('Trilho_Dir', df_dir)]
 
 
 @st.cache_resource
@@ -179,23 +439,16 @@ def load_yolo_model(nome_pt: str):
 
 @st.cache_resource
 def load_tabular_artifacts(artifacts_dir: str = ARTIFACTS_DIR):
-    """
-    Carrega artefatos do modelo tabular a partir da pasta `modelo/`.
-    Esperado em `modelo/`:
-      - best_model.joblib
-      - vectorizer.json
-      - label_encoder.joblib
-    """
     vectorizer_path = os.path.join(artifacts_dir, 'vectorizer.json')
     model_path = os.path.join(artifacts_dir, 'best_model.joblib')
     label_encoder_path = os.path.join(artifacts_dir, 'label_encoder.joblib')
 
     if not os.path.exists(vectorizer_path):
-        raise FileNotFoundError(f"Arquivo não encontrado: {vectorizer_path}")
+        raise FileNotFoundError(f'Arquivo não encontrado: {vectorizer_path}')
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Arquivo não encontrado: {model_path}")
+        raise FileNotFoundError(f'Arquivo não encontrado: {model_path}')
     if not os.path.exists(label_encoder_path):
-        raise FileNotFoundError(f"Arquivo não encontrado: {label_encoder_path}")
+        raise FileNotFoundError(f'Arquivo não encontrado: {label_encoder_path}')
 
     vectorizer = TableVectorizer.load(vectorizer_path)
     model = joblib.load(model_path)
@@ -224,7 +477,6 @@ def generate_bscan_buffer(df_win: pd.DataFrame, start: int, end: int, min_depth:
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
-
     for x, y, p in zip(x_coords, y_coords, probes):
         if 0 <= x < width and 0 <= y < height:
             cv2.fillPoly(img, [base_triangle + [x, y]], PROBE_TO_BGR.get(int(p), (0, 255, 255)))
@@ -298,16 +550,16 @@ def annotate_detection_on_image(img_draw: np.ndarray, det: Dict[str, object], la
     cv2.rectangle(img_draw, (vx1, vy1), (vx2, vy2), cor_bbox, 2)
 
     if tab_conf is not None:
-        lbl = f"TAB: {tab_class} ({tab_conf:.2f}) | YOLO: {yolo_class}"
+        lbl = f'TAB: {tab_class} ({tab_conf:.2f}) | YOLO: {yolo_class}'
     else:
-        lbl = f"TAB: {tab_class} | YOLO: {yolo_class}"
+        lbl = f'TAB: {tab_class} | YOLO: {yolo_class}'
 
     cv2.putText(img_draw, lbl, (vx1 + 4, max(18, vy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
     cv2.putText(img_draw, lbl, (vx1 + 4, max(18, vy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, cor_bbox, 1)
 
 
 def detectar_e_validar(df_raw: pd.DataFrame, modelos_ativos: Dict[str, List[YOLO]], vectorizer: TableVectorizer, model_tab, label_encoder):
-    progress_bar = st.progress(0.0, text="Gerando imagens B-scan, executando YOLO e validando BBs com o modelo tabular...")
+    progress_bar = st.progress(0.0, text='Gerando imagens B-scan, executando YOLO e validando BBs com o modelo tabular...')
     found = []
     gallery = []
 
@@ -320,7 +572,6 @@ def detectar_e_validar(df_raw: pd.DataFrame, modelos_ativos: Dict[str, List[YOLO
                 total_steps += max(1, math.ceil((int(df_side['odo'].max()) - int(df_side['odo'].min()) + 1) / STEP_MM))
 
     passo_atual = 0
-
     for local_nome, model_list in modelos_ativos.items():
         min_depth, max_depth = LIMITES_PROFUNDIDADE.get(local_nome, (0.0, 223.0))
         df_local = df_raw[(pd.to_numeric(df_raw['depth'], errors='coerce') >= min_depth) & (pd.to_numeric(df_raw['depth'], errors='coerce') < max_depth)].copy()
@@ -337,8 +588,7 @@ def detectar_e_validar(df_raw: pd.DataFrame, modelos_ativos: Dict[str, List[YOLO
             for start in range(odo_min, odo_max + 1, STEP_MM):
                 passo_atual += 1
                 if total_steps > 0:
-                    progress_bar.progress(min(0.02 + 0.98 * passo_atual / total_steps, 1.0),
-                                          text=f"Analisando {local_nome} ({lado_nome}) em ODO {start} mm...")
+                    progress_bar.progress(min(0.02 + 0.98 * passo_atual / total_steps, 1.0), text=f'Analisando {local_nome} ({lado_nome}) em ODO {start} mm...')
 
                 end = start + WINDOW_MM
                 df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] < end)].copy()
@@ -411,7 +661,7 @@ def detectar_e_validar(df_raw: pd.DataFrame, modelos_ativos: Dict[str, List[YOLO
 
                     found.append({
                         'ID_Global': len(found),
-                        'ID_Img': f"#{local_id}",
+                        'ID_Img': f'#{local_id}',
                         'Local': local_nome,
                         'Lado': lado_nome,
                         'Classe_YOLO': det['yolo_class'],
@@ -428,20 +678,20 @@ def detectar_e_validar(df_raw: pd.DataFrame, modelos_ativos: Dict[str, List[YOLO
                         'BBox_ODO_Max_mm': int(bbox_phys['odo_max_mm']),
                         'BBox_Depth_Min_mm': float(bbox_phys['depth_min_mm']),
                         'BBox_Depth_Max_mm': float(bbox_phys['depth_max_mm']),
-                        'Rows_Região_Tabular': int(len(region_df))
+                        'Rows_Região_Tabular': int(len(region_df)),
                     })
 
                 if houve_evento:
                     gallery.append({
                         'img': img_draw,
                         'img_clean': img_clean,
-                        'label': f"{lado_nome} @ {start}",
+                        'label': f'{lado_nome} @ {start}',
                         'odo_ref': start,
                         'lado': lado_nome,
                         'local': local_nome,
                     })
 
-    progress_bar.progress(1.0, text="✅ Processamento concluído!")
+    progress_bar.progress(1.0, text='✅ Processamento concluído!')
     return found, gallery
 
 
@@ -463,13 +713,13 @@ def generate_zip_of_annotated_images(img_gallery: List[Dict[str, object]]) -> by
     return zip_buffer.getvalue()
 
 # =====================================================================
-# 3. INTERFACE STREAMLIT
+# INTERFACE STREAMLIT
 # =====================================================================
 def main():
     st.set_page_config(
-        page_title="Validação Híbrida YOLO + Modelo Tabular (US)",
-        page_icon="logo.png",
-        layout="wide"
+        page_title='Validação Híbrida YOLO + Modelo Tabular (US)',
+        page_icon='logo.png',
+        layout='wide'
     )
 
     css = """
@@ -495,9 +745,9 @@ def main():
             st.markdown(f'<img src="data:image/png;base64,{img_logo}" style="width:140px; height:95px; object-fit:contain; border-radius:12px;"/>', unsafe_allow_html=True)
     with col_titulo:
         st.markdown("<h1 style='text-align:center;'>Validação Híbrida de Defeitos US: YOLO + Modelo Tabular</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align:center;'>Os arquivos da pasta <code>modelo/</code> são usados tanto pelo YOLO quanto pelo classificador tabular.</p>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align:center;'>A classe <code>TableVectorizer</code> do pipeline tabular foi incorporada neste arquivo para corrigir o <code>ModuleNotFoundError</code>.</p>", unsafe_allow_html=True)
 
-    with st.expander("ℹ️ Estrutura esperada da pasta modelo/"):
+    with st.expander('ℹ️ Estrutura esperada da pasta modelo/'):
         st.code("""modelo/
   best_alma_3.pt
   best_boleto_1.pt
@@ -512,14 +762,14 @@ def main():
     if 'hyb_gallery' not in st.session_state:
         st.session_state.hyb_gallery = []
     if 'hyb_page' not in st.session_state:
-        st.session_state.hyb_page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
+        st.session_state.hyb_page = {'Alma': 0, 'Boleto': 0, 'Patim': 0, '🌐 Visão Global': 0}
     if 'hyb_uploader_key' not in st.session_state:
         st.session_state.hyb_uploader_key = 0
 
     col_upload, col_botoes = st.columns([3, 1])
     with col_upload:
         files = st.file_uploader(
-            "Faça o upload dos arquivos CSV brutos de inspeção US",
+            'Faça o upload dos arquivos CSV brutos de inspeção US',
             type=['csv'],
             accept_multiple_files=True,
             key=f"hyb_uploader_{st.session_state.hyb_uploader_key}"
@@ -546,15 +796,15 @@ def main():
                 arquivos_prontos = True
 
     with col_botoes:
-        st.markdown("<br>", unsafe_allow_html=True)
-        btn_run = st.button("🚀 Iniciar inferência híbrida", type='primary', use_container_width=True, disabled=not arquivos_prontos)
-        if st.button("🧹 Limpar upload", use_container_width=True):
+        st.markdown('<br>', unsafe_allow_html=True)
+        btn_run = st.button('🚀 Iniciar inferência híbrida', type='primary', use_container_width=True, disabled=not arquivos_prontos)
+        if st.button('🧹 Limpar upload', use_container_width=True):
             st.session_state.hyb_uploader_key += 1
             st.rerun()
-        if st.button("🗑️ Resetar sistema", use_container_width=True):
+        if st.button('🗑️ Resetar sistema', use_container_width=True):
             st.session_state.hyb_deteccoes = []
             st.session_state.hyb_gallery = []
-            st.session_state.hyb_page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
+            st.session_state.hyb_page = {'Alma': 0, 'Boleto': 0, 'Patim': 0, '🌐 Visão Global': 0}
             st.session_state.hyb_uploader_key += 1
             st.cache_resource.clear()
             st.rerun()
@@ -583,7 +833,7 @@ def main():
         try:
             df_raw = preprocessar_raw(files)
         except Exception as e:
-            st.error(f"Erro no pré-processamento dos CSVs: {e}")
+            st.error(f'Erro no pré-processamento dos CSVs: {e}')
             st.stop()
 
         found, gallery = detectar_e_validar(df_raw, modelos_ativos, vectorizer, model_tab, label_encoder)
@@ -592,10 +842,10 @@ def main():
             st.session_state.hyb_gallery = gallery
             st.rerun()
         else:
-            st.info("A inferência híbrida foi concluída, mas nenhuma detecção foi validada pelo modelo tabular.")
+            st.info('A inferência híbrida foi concluída, mas nenhuma detecção foi validada pelo modelo tabular.')
 
     if st.session_state.hyb_deteccoes or st.session_state.hyb_gallery:
-        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown('<hr>', unsafe_allow_html=True)
         df_raw = pd.DataFrame(st.session_state.hyb_deteccoes) if st.session_state.hyb_deteccoes else pd.DataFrame()
         if not df_raw.empty:
             if 'Aprovado' not in df_raw.columns:
@@ -604,21 +854,21 @@ def main():
                 df_raw['Local'] = 'Alma'
 
         st.markdown("<h4 style='color:#FFC600; text-align:center;'>Alternar visualização:</h4>", unsafe_allow_html=True)
-        locais_fixos = ["Alma", "Boleto", "Patim", "🌐 Visão Global"]
-        local_selecionado = st.radio("Selecione:", locais_fixos, horizontal=True, label_visibility="collapsed")
+        locais_fixos = ['Alma', 'Boleto', 'Patim', '🌐 Visão Global']
+        local_selecionado = st.radio('Selecione:', locais_fixos, horizontal=True, label_visibility='collapsed')
 
-        if local_selecionado == "🌐 Visão Global":
-            tab_global = st.tabs(["📊 Relatório Global", "📦 Downloads"])
+        if local_selecionado == '🌐 Visão Global':
+            tab_global = st.tabs(['📊 Relatório Global', '📦 Downloads'])
             with tab_global[0]:
                 if not df_raw.empty:
                     df_aprov = df_raw[df_raw['Aprovado'] == True].copy()
-                    st.markdown("##### Resumo Global (aprovados)")
+                    st.markdown('##### Resumo Global (aprovados)')
                     contagem = df_aprov['Classe_Tabular'].value_counts().reset_index()
                     contagem.columns = ['Classe tabular validada', 'Quantidade']
                     st.dataframe(contagem, hide_index=True, use_container_width=True)
 
-                    st.markdown("##### Relatório consolidado")
-                    colunas = ['Local','Lado','Classe_YOLO','Classe_Tabular','ODO','Coordenada Depth(mm)','Largura(mm)','Altura(mm)','Confiança_YOLO','Confiança_Tabular','Rows_Região_Tabular']
+                    st.markdown('##### Relatório consolidado')
+                    colunas = ['Local', 'Lado', 'Classe_YOLO', 'Classe_Tabular', 'ODO', 'Coordenada Depth(mm)', 'Largura(mm)', 'Altura(mm)', 'Confiança_YOLO', 'Confiança_Tabular', 'Rows_Região_Tabular']
                     st.dataframe(df_aprov[colunas], hide_index=True, use_container_width=True)
                 else:
                     st.info('Nenhuma detecção aprovada disponível.')
@@ -627,38 +877,38 @@ def main():
                 if not df_raw.empty:
                     excel_data = generate_excel_report(df_raw)
                     st.download_button(
-                        label="📥 Baixar relatório híbrido (Excel)",
+                        label='📥 Baixar relatório híbrido (Excel)',
                         data=excel_data,
                         file_name=f"relatorio_hibrido_yolo_tabular_{datetime.now().strftime('%d%m%Y_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                         use_container_width=True
                     )
                 if st.session_state.hyb_gallery:
                     zip_imgs = generate_zip_of_annotated_images(st.session_state.hyb_gallery)
                     st.download_button(
-                        label="🖼️ Baixar imagens anotadas (ZIP)",
+                        label='🖼️ Baixar imagens anotadas (ZIP)',
                         data=zip_imgs,
                         file_name=f"imagens_anotadas_hibridas_{datetime.now().strftime('%d%m%Y_%H%M')}.zip",
-                        mime="application/zip",
+                        mime='application/zip',
                         use_container_width=True
                     )
         else:
             df_local = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
             gal_local = [g for g in st.session_state.hyb_gallery if g.get('local') == local_selecionado]
 
-            tabs = st.tabs(["📊 Tabela", "🖼️ Galeria"])
+            tabs = st.tabs(['📊 Tabela', '🖼️ Galeria'])
             with tabs[0]:
                 if not df_local.empty:
-                    st.markdown(f"##### Detecções validadas - {local_selecionado}")
-                    colunas = ['Lado','Classe_YOLO','Classe_Tabular','ODO','Coordenada Depth(mm)','Largura(mm)','Altura(mm)','Confiança_YOLO','Confiança_Tabular','Rows_Região_Tabular']
+                    st.markdown(f'##### Detecções validadas - {local_selecionado}')
+                    colunas = ['Lado', 'Classe_YOLO', 'Classe_Tabular', 'ODO', 'Coordenada Depth(mm)', 'Largura(mm)', 'Altura(mm)', 'Confiança_YOLO', 'Confiança_Tabular', 'Rows_Região_Tabular']
                     st.dataframe(df_local[colunas], hide_index=True, use_container_width=True)
                 else:
-                    st.info(f"Nenhuma detecção validada em {local_selecionado}.")
+                    st.info(f'Nenhuma detecção validada em {local_selecionado}.')
 
             with tabs[1]:
-                st.markdown("##### Galeria de imagens anotadas")
+                st.markdown('##### Galeria de imagens anotadas')
                 if not gal_local:
-                    st.info(f"Nenhuma imagem disponível em {local_selecionado}.")
+                    st.info(f'Nenhuma imagem disponível em {local_selecionado}.')
                 else:
                     itens_por_pagina = 12
                     total_pag = max(1, math.ceil(len(gal_local) / itens_por_pagina))
@@ -687,5 +937,5 @@ def main():
                                     st.session_state.hyb_page[local_selecionado] += 1
                                     st.rerun()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
